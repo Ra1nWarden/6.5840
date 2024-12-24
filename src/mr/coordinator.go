@@ -1,33 +1,119 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+)
 
 type Coordinator struct {
 	// Your definitions here.
-
+	mapTasks       map[string]int
+	reduceTasks    map[string]int
+	taskMap        map[int]taskStatus
+	nReduce        int
+	nextTaskNumber int
+	lock           sync.Mutex
 }
 
-// Your code here -- RPC handlers for the worker to call.
+type taskStatus struct {
+	startTime time.Time
+	endTime   time.Time
+	success   bool
+}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (c *Coordinator) checkTask(task int) bool {
+	if task == 0 {
+		return false
+	}
+	taskState := c.taskMap[task]
+	if taskState.success {
+		return true
+	}
+	elapsedTime := time.Since(taskState.startTime)
+	return elapsedTime <= (10 * time.Second)
+}
+
+func (c *Coordinator) phaseFinished(mapPhase bool) bool {
+	iterateMap := c.reduceTasks
+	if mapPhase {
+		iterateMap = c.mapTasks
+	}
+	for _, v := range iterateMap {
+		if v == 0 {
+			return false
+		}
+		if !c.taskMap[v].success {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) ServeTask(args *TaskArgs, reply *TaskReply) error {
+	for {
+		if c.phaseFinished(true) {
+			break
+		}
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		for k, v := range c.mapTasks {
+			if !c.checkTask(v) {
+				reply.InputFiles = []string{k}
+				reply.IsMapTask = true
+				reply.NumReduce = c.nReduce
+				reply.TaskNumber = c.nextTaskNumber
+				c.taskMap[c.nextTaskNumber] = taskStatus{startTime: time.Now()}
+				c.mapTasks[k] = c.nextTaskNumber
+				c.nextTaskNumber++
+				return nil
+			}
+		}
+	}
+	for {
+		if c.phaseFinished(false) {
+			break
+		}
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		for k, v := range c.reduceTasks {
+			if !c.checkTask(v) {
+				fileNames := []string{}
+				for _, vv := range c.mapTasks {
+					fileNames = append(fileNames, fmt.Sprintf("mr-%d-%s", vv, k))
+				}
+				reply.InputFiles = fileNames
+				reply.IsMapTask = false
+				reply.TaskNumber = c.nextTaskNumber
+				reply.ReduceKey = k
+				c.taskMap[c.nextTaskNumber] = taskStatus{startTime: time.Now()}
+				c.reduceTasks[k] = c.nextTaskNumber
+				c.nextTaskNumber++
+				return nil
+			}
+		}
+	}
+	reply.IsFinished = true
 	return nil
 }
 
+func (c *Coordinator) ReceiveTaskComplete(args *TaskCompleteArgs, reply *TaskCompleteReply) error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	taskState := c.taskMap[args.TaskNumber]
+	taskState.endTime = time.Now()
+	taskState.success = args.Success
+	c.taskMap[args.TaskNumber] = taskState
+	return nil
+}
 
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
@@ -41,29 +127,34 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-//
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	return c.phaseFinished(true) && c.phaseFinished(false)
 }
 
-//
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
+	c.mapTasks = make(map[string]int)
+	c.reduceTasks = make(map[string]int)
+	c.taskMap = make(map[int]taskStatus)
+	c.nReduce = nReduce
 
+	for _, v := range files {
+		c.mapTasks[v] = 0
+	}
+
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[strconv.Itoa(i)] = 0
+	}
+
+	c.nextTaskNumber = 1
+	c.lock = sync.Mutex{}
 
 	c.server()
 	return &c
