@@ -41,18 +41,22 @@ func (c *Coordinator) checkTask(task int) bool {
 }
 
 func (c *Coordinator) phaseFinished(mapPhase bool) bool {
+	c.lock.Lock()
 	iterateMap := c.reduceTasks
 	if mapPhase {
 		iterateMap = c.mapTasks
 	}
 	for _, v := range iterateMap {
 		if v == 0 {
+			c.lock.Unlock()
 			return false
 		}
 		if !c.taskMap[v].success {
+			c.lock.Unlock()
 			return false
 		}
 	}
+	c.lock.Unlock()
 	return true
 }
 
@@ -62,7 +66,6 @@ func (c *Coordinator) ServeTask(args *TaskArgs, reply *TaskReply) error {
 			break
 		}
 		c.lock.Lock()
-		defer c.lock.Unlock()
 		for k, v := range c.mapTasks {
 			if !c.checkTask(v) {
 				reply.InputFiles = []string{k}
@@ -72,16 +75,18 @@ func (c *Coordinator) ServeTask(args *TaskArgs, reply *TaskReply) error {
 				c.taskMap[c.nextTaskNumber] = taskStatus{startTime: time.Now()}
 				c.mapTasks[k] = c.nextTaskNumber
 				c.nextTaskNumber++
+				c.lock.Unlock()
 				return nil
 			}
 		}
+		c.lock.Unlock()
+		time.Sleep(time.Second)
 	}
 	for {
 		if c.phaseFinished(false) {
 			break
 		}
 		c.lock.Lock()
-		defer c.lock.Unlock()
 		for k, v := range c.reduceTasks {
 			if !c.checkTask(v) {
 				fileNames := []string{}
@@ -95,9 +100,12 @@ func (c *Coordinator) ServeTask(args *TaskArgs, reply *TaskReply) error {
 				c.taskMap[c.nextTaskNumber] = taskStatus{startTime: time.Now()}
 				c.reduceTasks[k] = c.nextTaskNumber
 				c.nextTaskNumber++
+				c.lock.Unlock()
 				return nil
 			}
 		}
+		c.lock.Unlock()
+		time.Sleep(time.Second)
 	}
 	reply.IsFinished = true
 	return nil
@@ -105,11 +113,11 @@ func (c *Coordinator) ServeTask(args *TaskArgs, reply *TaskReply) error {
 
 func (c *Coordinator) ReceiveTaskComplete(args *TaskCompleteArgs, reply *TaskCompleteReply) error {
 	c.lock.Lock()
-	defer c.lock.Unlock()
 	taskState := c.taskMap[args.TaskNumber]
 	taskState.endTime = time.Now()
 	taskState.success = args.Success
 	c.taskMap[args.TaskNumber] = taskState
+	c.lock.Unlock()
 	return nil
 }
 
