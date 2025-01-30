@@ -173,6 +173,18 @@ func (rf *Raft) transitRole(role Role) {
 	}
 }
 
+// Generate RequestVoteArgs for election - needs lock
+func (rf *Raft) prepForElection() RequestVoteArgs {
+	rf.transitRole(Candidate)
+	rf.lastElectionStart = time.Now()
+	return RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log),
+		LastLogTerm:  rf.getLastLogTerm(),
+	}
+}
+
 // Start election
 func (rf *Raft) startElectionWithArgs(args *RequestVoteArgs) {
 	votesChan := make(chan bool)
@@ -435,29 +447,15 @@ func (rf *Raft) ticker() {
 		switch rf.role {
 		case Follower:
 			if time.Since(rf.lastPing) > rf.electionTimeOut {
-				rf.transitRole(Candidate)
-				rf.lastElectionStart = time.Now()
-				args := &RequestVoteArgs{
-					Term:         rf.currentTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: len(rf.log),
-					LastLogTerm:  rf.getLastLogTerm(),
-				}
 				DPrintf("server %d start election term %d\n", rf.me, rf.currentTerm)
-				go rf.startElectionWithArgs(args)
+				args := rf.prepForElection()
+				go rf.startElectionWithArgs(&args)
 			}
 		case Candidate:
 			if time.Since(rf.lastElectionStart) > rf.electionTimeOut {
-				rf.currentTerm++
-				rf.lastElectionStart = time.Now()
-				args := &RequestVoteArgs{
-					Term:         rf.currentTerm,
-					CandidateId:  rf.me,
-					LastLogIndex: len(rf.log),
-					LastLogTerm:  rf.getLastLogTerm(),
-				}
 				DPrintf("server %d restarts election term %d\n", rf.me, rf.currentTerm)
-				go rf.startElectionWithArgs(args)
+				args := rf.prepForElection()
+				go rf.startElectionWithArgs(&args)
 			}
 		case Leader:
 			args := &AppendEntriesArgs{
