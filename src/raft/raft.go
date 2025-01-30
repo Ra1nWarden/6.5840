@@ -198,11 +198,9 @@ func (rf *Raft) startElectionWithArgs(args *RequestVoteArgs) {
 				Term:     rf.currentTerm,
 				LeaderId: rf.me,
 			}
-			rf.mu.Unlock()
 			rf.sendHeartBeatsWithArgs(args)
-		} else {
-			rf.mu.Unlock()
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -261,11 +259,11 @@ func (rf *Raft) sendRequestVoteAndHandle(server int, args *RequestVoteArgs, resu
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	DPrintf("server %d handles vote from %d for term %d\n", rf.me, args.CandidateId, args.Term)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		rf.mu.Unlock()
 		return
 	}
 
@@ -273,7 +271,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = (rf.votedFor == args.CandidateId)
 		DPrintf("server %d already voted for %d in term %d\n", rf.me, rf.votedFor, rf.currentTerm)
-		rf.mu.Unlock()
 		return
 	}
 
@@ -300,7 +297,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = willVote
-	rf.mu.Unlock()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -349,11 +345,11 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		DPrintf("server %d rejects heart beat from %d with higher term %d\n", rf.me, args.LeaderId, rf.currentTerm)
-		rf.mu.Unlock()
 		return
 	}
 
@@ -378,7 +374,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.leaderId = args.LeaderId
 	reply.Success = true
 	reply.Term = rf.currentTerm
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendHeartBeatsAndHandle(server int, args *AppendEntriesArgs) {
@@ -449,10 +444,7 @@ func (rf *Raft) ticker() {
 					LastLogTerm:  rf.getLastLogTerm(),
 				}
 				DPrintf("server %d start election term %d\n", rf.me, rf.currentTerm)
-				rf.mu.Unlock()
 				go rf.startElectionWithArgs(args)
-			} else {
-				rf.mu.Unlock()
 			}
 		case Candidate:
 			if time.Since(rf.lastElectionStart) > rf.electionTimeOut {
@@ -465,19 +457,17 @@ func (rf *Raft) ticker() {
 					LastLogTerm:  rf.getLastLogTerm(),
 				}
 				DPrintf("server %d restarts election term %d\n", rf.me, rf.currentTerm)
-				rf.mu.Unlock()
 				go rf.startElectionWithArgs(args)
-			} else {
-				rf.mu.Unlock()
 			}
 		case Leader:
 			args := &AppendEntriesArgs{
 				Term:     rf.currentTerm,
 				LeaderId: rf.me,
 			}
-			rf.mu.Unlock()
 			rf.sendHeartBeatsWithArgs(args)
 		}
+
+		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
