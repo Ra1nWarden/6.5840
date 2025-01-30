@@ -200,19 +200,20 @@ func (rf *Raft) startElectionWithArgs(args *RequestVoteArgs) {
 		if <-votesChan {
 			votes++
 		}
-	}
-	if votes > len(rf.peers)/2 {
-		DPrintf("%d won election term %d\n", args.CandidateId, args.Term)
-		rf.mu.Lock()
-		if rf.role == Candidate && rf.currentTerm == args.Term {
-			rf.transitRole(Leader)
-			args := &AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
+		if votes > len(rf.peers)/2 {
+			DPrintf("%d won election term %d\n", args.CandidateId, args.Term)
+			rf.mu.Lock()
+			if rf.role == Candidate && rf.currentTerm == args.Term {
+				rf.transitRole(Leader)
+				args := &AppendEntriesArgs{
+					Term:     rf.currentTerm,
+					LeaderId: rf.me,
+				}
+				rf.sendHeartBeatsWithArgs(args)
 			}
-			rf.sendHeartBeatsWithArgs(args)
+			rf.mu.Unlock()
+			break
 		}
-		rf.mu.Unlock()
 	}
 }
 
