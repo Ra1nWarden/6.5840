@@ -327,7 +327,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Update current term and reset vote
 	if args.Term > rf.currentTerm {
-		DPrintf("server %d transit to follower after receiving a higher term %d from %d\n", rf.me, args.Term, args.CandidateId)
 		rf.transitRole(Follower)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -481,7 +480,7 @@ func (rf *Raft) sendAppendEntriesAndHandle(server int, args *AppendEntriesArgs) 
 	}
 
 	rf.mu.Lock()
-	DPrintf("replication response %t from %d to %d\n", reply.Success, args.LeaderId, server)
+	DPrintf("replication response for {%d, %d, command len %d} is %t from %d to %d\n", args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), reply.Success, args.LeaderId, server)
 	if reply.Success {
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
@@ -494,12 +493,13 @@ func (rf *Raft) sendAppendEntriesAndHandle(server int, args *AppendEntriesArgs) 
 func (rf *Raft) startReplication(index int, term int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.role != Leader || rf.currentTerm != term {
+		if rf.role != Leader || rf.currentTerm != term || index != len(rf.log) {
 			rf.mu.Unlock()
 			break
 		}
 		synced := 0
 		committed := false
+		DPrintf("Start Replication all over again for index %d\n", index)
 		for server := 0; server < len(rf.peers); server++ {
 			if server == rf.me || rf.matchIndex[server] >= index {
 				synced++
@@ -529,7 +529,7 @@ func (rf *Raft) startReplication(index int, term int) {
 		}
 
 		// Sleep if not finished
-		time.Sleep(time.Duration(300) * time.Millisecond)
+		time.Sleep(time.Duration(700) * time.Millisecond)
 	}
 }
 
@@ -550,6 +550,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := len(rf.log)
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
+	DPrintf("Start for %v received by %d with {%d %d %t}\n", command, rf.me, index, term, isLeader)
 
 	// Your code here (3B).
 	if isLeader {
