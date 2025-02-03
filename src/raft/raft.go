@@ -393,8 +393,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term                   int
+	Success                bool
+	RejectedTermFirstIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -427,7 +428,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	if rf.commitIndex < args.LeaderCommit && rf.commitIndex < args.MatchIndex {
-		go rf.updateCommitIndexAndApply(min(args.LeaderCommit, args.MatchIndex))
+		go rf.updateCommitIndexAndApply(min(len(rf.log), min(args.LeaderCommit, args.MatchIndex)))
 	}
 
 	// Early return for heart beat
@@ -436,8 +437,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex > len(rf.log) || args.PrevLogTerm != rf.getLogTerm(args.PrevLogIndex) {
+	if args.PrevLogIndex > len(rf.log) {
 		reply.Success = false
+		reply.RejectedTermFirstIndex = len(rf.log)
+		return
+	}
+
+	if args.PrevLogTerm != rf.getLogTerm(args.PrevLogIndex) {
+		reply.Success = false
+		rejectedTerm := rf.getLogTerm(args.PrevLogIndex)
+		for index := args.PrevLogIndex; index > 0; index-- {
+			if rf.getLogTerm(index) != rejectedTerm {
+				break
+			}
+			reply.RejectedTermFirstIndex = index
+		}
 		return
 	}
 
@@ -470,7 +484,7 @@ func (rf *Raft) sendAppendEntriesAndHandle(server int, args *AppendEntriesArgs) 
 		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	} else {
-		rf.nextIndex[server]--
+		rf.nextIndex[server] = reply.RejectedTermFirstIndex
 	}
 	rf.mu.Unlock()
 }
