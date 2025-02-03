@@ -200,6 +200,7 @@ func (rf *Raft) updateCommitIndexAndApply(newCommitIndex int, term int) {
 		rf.mu.Unlock()
 		return
 	}
+	DPrintf("Update commit index in %d from %d to %d\n", rf.me, rf.commitIndex, newCommitIndex)
 	rf.commitIndex = newCommitIndex
 	for rf.lastApplied < rf.commitIndex {
 		msg := ApplyMsg{
@@ -456,7 +457,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+	DPrintf("Server %d before merge rf.log is %d: %v\n", rf.me, len(rf.log), rf.log)
+	entryIndex := 0
+	logCutIndex := args.PrevLogIndex + 1
+	mismatch := false
+	for {
+		if entryIndex >= len(args.Entries) || logCutIndex > len(rf.log) {
+			break
+		}
+		if rf.getLogTerm(logCutIndex) != args.Entries[entryIndex].Term {
+			mismatch = true
+			break
+		}
+		entryIndex++
+		logCutIndex++
+	}
+	if mismatch || len(args.Entries)+args.PrevLogIndex > len(rf.log) {
+		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+	}
+	DPrintf("Server %d After merge rf.log is %d: %v\n", rf.me, len(rf.log), rf.log)
 
 	if args.LeaderCommit > rf.commitIndex {
 		go rf.updateCommitIndexAndApply(min(args.LeaderCommit, len(rf.log)), rf.currentTerm)
@@ -480,10 +499,17 @@ func (rf *Raft) sendAppendEntriesAndHandle(server int, args *AppendEntriesArgs) 
 	}
 
 	rf.mu.Lock()
+	if rf.currentTerm != args.Term || rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
 	DPrintf("replication response for {%d, %d, command len %d} is %t from %d to %d\n", args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), reply.Success, args.LeaderId, server)
 	if reply.Success {
-		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		newMatchIndex := args.PrevLogIndex + len(args.Entries)
+		if rf.matchIndex[server] < newMatchIndex {
+			rf.matchIndex[server] = newMatchIndex
+			rf.nextIndex[server] = newMatchIndex + 1
+		}
 	} else {
 		rf.nextIndex[server] = reply.RejectedTermFirstIndex
 	}
@@ -491,6 +517,7 @@ func (rf *Raft) sendAppendEntriesAndHandle(server int, args *AppendEntriesArgs) 
 }
 
 func (rf *Raft) startReplication(index int, term int) {
+	committed := false
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.role != Leader || rf.currentTerm != term || index != len(rf.log) {
@@ -498,8 +525,6 @@ func (rf *Raft) startReplication(index int, term int) {
 			break
 		}
 		synced := 0
-		committed := false
-		DPrintf("Start Replication all over again for index %d\n", index)
 		for server := 0; server < len(rf.peers); server++ {
 			if server == rf.me || rf.matchIndex[server] >= index {
 				synced++
@@ -529,7 +554,7 @@ func (rf *Raft) startReplication(index int, term int) {
 		}
 
 		// Sleep if not finished
-		time.Sleep(time.Duration(700) * time.Millisecond)
+		time.Sleep(time.Duration(200) * time.Millisecond)
 	}
 }
 
