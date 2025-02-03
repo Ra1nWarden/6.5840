@@ -494,7 +494,7 @@ func (rf *Raft) startReplication(index int) {
 				LeaderId:     rf.me,
 				PrevLogIndex: prevIndex,
 				PrevLogTerm:  rf.getLogTerm(prevIndex),
-				Entries:      rf.log[prevIndex:],
+				Entries:      append([]LogEntry(nil), rf.log[prevIndex:]...),
 				LeaderCommit: rf.commitIndex,
 			}
 			go rf.sendAppendEntriesAndHandle(server, args)
