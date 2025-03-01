@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -132,6 +134,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	state := writer.Bytes()
+	rf.persister.Save(state, nil)
 }
 
 // restore previously persisted state.
@@ -152,6 +161,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	reader := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(reader)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if decoder.Decode(&currentTerm) != nil || decoder.Decode(&votedFor) != nil || decoder.Decode(&log) != nil {
+		DPrintf("Decode error")
+	} else {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // Helper for get log term
@@ -171,6 +194,7 @@ func (rf *Raft) fallbackToFollowerWithNewTerm(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = -1
 	rf.transitRole(Follower)
+	rf.persist()
 	rf.mu.Unlock()
 }
 
@@ -183,6 +207,7 @@ func (rf *Raft) transitRole(role Role) {
 	case Candidate:
 		rf.currentTerm++
 		rf.votedFor = rf.me
+		rf.persist()
 	case Leader:
 		rf.leaderId = rf.me
 		rf.nextIndex = make([]int, len(rf.peers))
@@ -331,6 +356,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.transitRole(Follower)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	// Check if candidate's log is at least as up-to-date as the current instance
@@ -344,6 +370,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Update vote
 	if willVote {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -423,6 +450,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	rf.lastPing = time.Now()
@@ -474,6 +502,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if mismatch || len(args.Entries)+args.PrevLogIndex > len(rf.log) {
 		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+		rf.persist()
 	}
 	DPrintf("Server %d After merge rf.log is %d: %v\n", rf.me, len(rf.log), rf.log)
 
@@ -581,6 +610,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: term, Command: command})
 		index = len(rf.log)
+		rf.persist()
 		rf.mu.Unlock()
 		go rf.startReplication(index, term)
 	} else {
