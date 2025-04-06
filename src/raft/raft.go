@@ -332,12 +332,79 @@ func (rf *Raft) sendHeartBeats() {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	DPrintf("Snapshot is called on %d", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.snapshot = snapshot
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = rf.getLogTerm(index)
 	rf.log = rf.log[index+1:]
+	DPrintf("Snapshot is finished on %d", rf.me)
+}
+
+// InstallSnapshot RPC
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.leaderId = args.LeaderId
+	rf.currentTerm = args.Term
+
+	if args.LastIncludedIndex < rf.lastIncludedIndex {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if rf.getLastLogIndex() > args.LastIncludedIndex {
+		argsLastIndexTrimmed := args.LastIncludedIndex - rf.lastIncludedIndex - 1
+		if rf.getLogTerm(argsLastIndexTrimmed) == args.LastIncludedTerm {
+			rf.log = rf.log[argsLastIndexTrimmed+1:]
+		} else {
+			rf.log = rf.log[:0]
+		}
+	}
+
+	rf.snapshot = args.Data
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+}
+
+func (rf *Raft) sendInstallSnapshotAndHandle(server int, args *InstallSnapshotArgs) {
+	reply := &InstallSnapshotReply{}
+	if !rf.peers[server].Call("Raft.InstallSnapshot", args, reply) {
+		return
+	}
+
+	if reply.Term > args.Term {
+		rf.fallbackToFollowerWithNewTerm(reply.Term)
+	}
+
+	rf.mu.Lock()
+	if rf.currentTerm != args.Term || rf.role != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.matchIndex[server] = args.LastIncludedIndex
+	rf.nextIndex[server] = args.LastIncludedIndex + 1
+	rf.mu.Unlock()
 }
 
 // example RequestVote RPC arguments structure.
@@ -598,15 +665,27 @@ func (rf *Raft) startReplication(index int, term int) {
 				continue
 			}
 			prevIndex := rf.nextIndex[server] - 1
-			args := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevIndex,
-				PrevLogTerm:  rf.getLogTerm(prevIndex), // FIXME: need to update
-				Entries:      append([]LogEntry(nil), rf.log[prevIndex:]...),
-				LeaderCommit: rf.commitIndex,
+			prevIndexTrimmed := prevIndex - rf.lastIncludedIndex - 1
+			if prevIndexTrimmed < 0 {
+				args := &InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.lastIncludedIndex,
+					LastIncludedTerm:  rf.lastIncludedTerm,
+					Data:              rf.snapshot,
+				}
+				go rf.sendInstallSnapshotAndHandle(server, args)
+			} else {
+				args := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevIndex,
+					PrevLogTerm:  rf.getLogTerm(prevIndexTrimmed),
+					Entries:      append([]LogEntry(nil), rf.log[prevIndexTrimmed:]...),
+					LeaderCommit: rf.commitIndex,
+				}
+				go rf.sendAppendEntriesAndHandle(server, args)
 			}
-			go rf.sendAppendEntriesAndHandle(server, args)
 		}
 		rf.mu.Unlock()
 
