@@ -190,12 +190,30 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-// Helper for get log term
+// Helper for get log term - idx in rf.log
 func (rf *Raft) getLogTerm(idx int) int {
 	if idx == 0 || len(rf.log) == 0 {
 		return 0
 	}
 	return rf.log[idx-1].Term
+}
+
+// Helper to get log length (counting snapshot)
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.log) + rf.lastIncludedIndex + 1
+}
+
+// Helper to get last log term
+func (rf *Raft) getLastLogTerm() int {
+	if len(rf.log) == 0 {
+		if rf.snapshot != nil {
+			return rf.lastIncludedTerm
+		} else {
+			return 0
+		}
+	} else {
+		return rf.log[len(rf.log)-1].Term
+	}
 }
 
 func (rf *Raft) fallbackToFollowerWithNewTerm(newTerm int) {
@@ -225,7 +243,7 @@ func (rf *Raft) transitRole(role Role) {
 		rf.leaderId = rf.me
 		rf.nextIndex = make([]int, len(rf.peers))
 		for i := range rf.nextIndex {
-			rf.nextIndex[i] = len(rf.log) + 1
+			rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		}
 		rf.matchIndex = make([]int, len(rf.peers))
 	}
@@ -234,7 +252,7 @@ func (rf *Raft) transitRole(role Role) {
 // Updates commit index and apply to state machine
 func (rf *Raft) updateCommitIndexAndApply(newCommitIndex int, term int) {
 	rf.mu.Lock()
-	if newCommitIndex <= rf.commitIndex || newCommitIndex > len(rf.log) || rf.currentTerm != term {
+	if newCommitIndex <= rf.commitIndex || newCommitIndex > rf.getLastLogIndex() || rf.currentTerm != term {
 		rf.mu.Unlock()
 		return
 	}
@@ -259,8 +277,8 @@ func (rf *Raft) prepForElection() RequestVoteArgs {
 	return RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log),
-		LastLogTerm:  rf.getLogTerm(len(rf.log)),
+		LastLogIndex: rf.getLastLogIndex(),
+		LastLogTerm:  rf.getLastLogTerm(),
 	}
 }
 
@@ -318,6 +336,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	rf.snapshot = snapshot
 	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.getLogTerm(index)
+	rf.log = rf.log[index+1:]
 }
 
 // example RequestVote RPC arguments structure.
@@ -377,10 +397,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Check if candidate's log is at least as up-to-date as the current instance
 	willVote := false
-	if args.LastLogTerm == rf.getLogTerm(len(rf.log)) {
-		willVote = args.LastLogIndex >= len(rf.log)
+	if args.LastLogTerm == rf.getLastLogTerm() {
+		willVote = args.LastLogIndex >= rf.getLastLogIndex()
 	} else {
-		willVote = args.LastLogTerm > rf.getLogTerm(len(rf.log))
+		willVote = args.LastLogTerm > rf.getLastLogTerm()
 	}
 
 	// Update vote
@@ -474,7 +494,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	if rf.commitIndex < args.LeaderCommit && rf.commitIndex < args.MatchIndex {
-		go rf.updateCommitIndexAndApply(min(len(rf.log), min(args.LeaderCommit, args.MatchIndex)), rf.currentTerm)
+		go rf.updateCommitIndexAndApply(min(rf.getLastLogIndex(), min(args.LeaderCommit, args.MatchIndex)), rf.currentTerm)
 	}
 
 	// Early return for heart beat
@@ -483,16 +503,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex > len(rf.log) {
+	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
-		reply.RejectedTermFirstIndex = len(rf.log)
+		reply.RejectedTermFirstIndex = rf.getLastLogIndex()
 		return
 	}
 
-	if args.PrevLogTerm != rf.getLogTerm(args.PrevLogIndex) {
+	argsPrevLogIndexTrimmed := args.PrevLogIndex - rf.lastIncludedIndex - 1
+
+	if args.PrevLogTerm != rf.getLogTerm(argsPrevLogIndexTrimmed) {
 		reply.Success = false
-		rejectedTerm := rf.getLogTerm(args.PrevLogIndex)
-		for index := args.PrevLogIndex; index > 0; index-- {
+		rejectedTerm := rf.getLogTerm(argsPrevLogIndexTrimmed)
+		for index := argsPrevLogIndexTrimmed; index > 0; index-- {
 			if rf.getLogTerm(index) != rejectedTerm {
 				break
 			}
@@ -503,7 +525,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	DPrintf("Server %d before merge rf.log is %d: %v\n", rf.me, len(rf.log), rf.log)
 	entryIndex := 0
-	logCutIndex := args.PrevLogIndex + 1
+	logCutIndex := argsPrevLogIndexTrimmed + 1
 	mismatch := false
 	for {
 		if entryIndex >= len(args.Entries) || logCutIndex > len(rf.log) {
@@ -516,14 +538,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		entryIndex++
 		logCutIndex++
 	}
-	if mismatch || len(args.Entries)+args.PrevLogIndex > len(rf.log) {
-		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+	if mismatch || len(args.Entries)+argsPrevLogIndexTrimmed > len(rf.log) {
+		rf.log = append(rf.log[:argsPrevLogIndexTrimmed], args.Entries...)
 		rf.persist()
 	}
 	DPrintf("Server %d After merge rf.log is %d: %v\n", rf.me, len(rf.log), rf.log)
 
 	if args.LeaderCommit > rf.commitIndex {
-		go rf.updateCommitIndexAndApply(min(args.LeaderCommit, len(rf.log)), rf.currentTerm)
+		go rf.updateCommitIndexAndApply(min(args.LeaderCommit, rf.getLastLogIndex()), rf.currentTerm)
 	}
 	reply.Success = true
 }
@@ -565,7 +587,7 @@ func (rf *Raft) startReplication(index int, term int) {
 	committed := false
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.role != Leader || rf.currentTerm != term || index != len(rf.log) {
+		if rf.role != Leader || rf.currentTerm != term || index != rf.getLastLogIndex() {
 			rf.mu.Unlock()
 			break
 		}
@@ -580,7 +602,7 @@ func (rf *Raft) startReplication(index int, term int) {
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: prevIndex,
-				PrevLogTerm:  rf.getLogTerm(prevIndex),
+				PrevLogTerm:  rf.getLogTerm(prevIndex), // FIXME: need to update
 				Entries:      append([]LogEntry(nil), rf.log[prevIndex:]...),
 				LeaderCommit: rf.commitIndex,
 			}
@@ -617,7 +639,7 @@ func (rf *Raft) startReplication(index int, term int) {
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
-	index := len(rf.log)
+	index := rf.getLastLogIndex()
 	term := rf.currentTerm
 	isLeader := rf.role == Leader
 	DPrintf("Start for %v received by %d with {%d %d %t}\n", command, rf.me, index, term, isLeader)
@@ -625,7 +647,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (3B).
 	if isLeader {
 		rf.log = append(rf.log, LogEntry{Term: term, Command: command})
-		index = len(rf.log)
+		index = rf.getLastLogIndex()
 		rf.persist()
 		rf.mu.Unlock()
 		go rf.startReplication(index, term)
