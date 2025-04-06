@@ -87,6 +87,11 @@ type Raft struct {
 	votedFor    int
 	log         []LogEntry
 
+	// 3D
+	snapshot          []byte
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
 	// Volatile state on all servers
 	commitIndex       int
 	lastApplied       int
@@ -139,8 +144,10 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.votedFor)
 	encoder.Encode(rf.log)
+	encoder.Encode(rf.lastIncludedIndex)
+	encoder.Encode(rf.lastIncludedTerm)
 	state := writer.Bytes()
-	rf.persister.Save(state, nil)
+	rf.persister.Save(state, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -166,7 +173,11 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
-	if decoder.Decode(&currentTerm) != nil || decoder.Decode(&votedFor) != nil || decoder.Decode(&log) != nil {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if decoder.Decode(&currentTerm) != nil || decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&log) != nil || decoder.Decode(&lastIncludedIndex) != nil ||
+		decoder.Decode(&lastIncludedTerm) != nil {
 		DPrintf("Decode error")
 	} else {
 		rf.mu.Lock()
@@ -174,6 +185,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
@@ -301,7 +314,10 @@ func (rf *Raft) sendHeartBeats() {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.snapshot = snapshot
+	rf.lastIncludedIndex = index
 }
 
 // example RequestVote RPC arguments structure.
@@ -693,6 +709,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimeOut = time.Duration(500+(rand.Int63()%100)) * time.Millisecond
 
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = 0
+
 	rf.log = make([]LogEntry, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -700,6 +719,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.snapshot = persister.ReadSnapshot()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
