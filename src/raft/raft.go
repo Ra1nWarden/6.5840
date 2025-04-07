@@ -200,7 +200,7 @@ func (rf *Raft) getLogTerm(idx int) int {
 
 // Helper to get log length (counting snapshot)
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.log) + rf.lastIncludedIndex + 1
+	return len(rf.log) + rf.lastIncludedIndex
 }
 
 // Helper to get last log term
@@ -258,16 +258,27 @@ func (rf *Raft) updateCommitIndexAndApply(newCommitIndex int, term int) {
 	}
 	DPrintf("Update commit index in %d from %d to %d\n", rf.me, rf.commitIndex, newCommitIndex)
 	rf.commitIndex = newCommitIndex
-	for rf.lastApplied < rf.commitIndex {
+	rf.mu.Unlock()
+	go rf.maybeApply()
+}
+
+func (rf *Raft) maybeApply() {
+	rf.mu.Lock()
+	if rf.lastApplied < rf.commitIndex {
+		lastAppliedTrimmed := rf.lastApplied - rf.lastIncludedIndex
+		rf.lastApplied++
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[rf.lastApplied].Command,
-			CommandIndex: rf.lastApplied + 1,
+			Command:      rf.log[lastAppliedTrimmed].Command,
+			CommandIndex: rf.lastApplied,
 		}
+		rf.mu.Unlock()
+		DPrintf("MaybeApply(%v)", msg)
 		rf.applyCh <- msg
-		rf.lastApplied++
+		rf.maybeApply()
+	} else {
+		rf.mu.Unlock()
 	}
-	rf.mu.Unlock()
 }
 
 // Generate RequestVoteArgs for election - needs lock
@@ -334,11 +345,28 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	DPrintf("Snapshot is called on %d", rf.me)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	if index <= rf.lastIncludedIndex {
+		rf.mu.Unlock()
+		return
+	}
+	indexTrimmed := index - rf.lastIncludedIndex
+
+	if len(rf.log) < indexTrimmed {
+		rf.mu.Unlock()
+		return
+	}
+
 	rf.snapshot = snapshot
 	rf.lastIncludedIndex = index
-	rf.lastIncludedTerm = rf.getLogTerm(index)
-	rf.log = rf.log[index+1:]
+	rf.lastIncludedTerm = rf.getLogTerm(indexTrimmed)
+	rf.log = rf.log[indexTrimmed:]
+	if index > rf.lastApplied {
+		rf.lastApplied = index
+	}
+	if index > rf.commitIndex {
+		rf.commitIndex = index
+	}
+	rf.mu.Unlock()
 	DPrintf("Snapshot is finished on %d", rf.me)
 }
 
@@ -357,33 +385,69 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
-
-	rf.leaderId = args.LeaderId
-	rf.currentTerm = args.Term
 
 	if args.LastIncludedIndex < rf.lastIncludedIndex {
-		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 		return
 	}
 
+	shouldTransitToFollower := false
+	if rf.role == Candidate {
+		shouldTransitToFollower = args.Term >= rf.currentTerm
+	} else if rf.role == Leader {
+		shouldTransitToFollower = args.Term > rf.currentTerm
+	}
+
+	if shouldTransitToFollower {
+		rf.transitRole(Follower)
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	rf.lastPing = time.Now()
+	rf.leaderId = args.LeaderId
+	reply.Term = rf.currentTerm
+
 	if rf.getLastLogIndex() > args.LastIncludedIndex {
-		argsLastIndexTrimmed := args.LastIncludedIndex - rf.lastIncludedIndex - 1
+		argsLastIndexTrimmed := args.LastIncludedIndex - rf.lastIncludedIndex
 		if rf.getLogTerm(argsLastIndexTrimmed) == args.LastIncludedTerm {
-			rf.log = rf.log[argsLastIndexTrimmed+1:]
+			rf.log = rf.log[argsLastIndexTrimmed:]
 		} else {
 			rf.log = rf.log[:0]
 		}
+	} else {
+		rf.log = rf.log[:0]
 	}
 
 	rf.snapshot = args.Data
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.persist()
+	if args.LastIncludedIndex > rf.lastApplied {
+		rf.lastApplied = args.LastIncludedIndex
+	}
+	if args.LastIncludedIndex > rf.commitIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.snapshot,
+		SnapshotTerm:  rf.lastIncludedTerm,
+		SnapshotIndex: rf.lastIncludedIndex,
+	}
+	rf.mu.Unlock()
+	DPrintf("InstallSnapshot(%v)", msg)
+	rf.applyCh <- msg
 }
 
 func (rf *Raft) sendInstallSnapshotAndHandle(server int, args *InstallSnapshotArgs) {
@@ -576,7 +640,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	argsPrevLogIndexTrimmed := args.PrevLogIndex - rf.lastIncludedIndex - 1
+	argsPrevLogIndexTrimmed := args.PrevLogIndex - rf.lastIncludedIndex
 
 	if args.PrevLogTerm != rf.getLogTerm(argsPrevLogIndexTrimmed) {
 		reply.Success = false
@@ -665,7 +729,7 @@ func (rf *Raft) startReplication(index int, term int) {
 				continue
 			}
 			prevIndex := rf.nextIndex[server] - 1
-			prevIndexTrimmed := prevIndex - rf.lastIncludedIndex - 1
+			prevIndexTrimmed := prevIndex - rf.lastIncludedIndex
 			if prevIndexTrimmed < 0 {
 				args := &InstallSnapshotArgs{
 					Term:              rf.currentTerm,
@@ -810,7 +874,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.electionTimeOut = time.Duration(500+(rand.Int63()%100)) * time.Millisecond
 
-	rf.lastIncludedIndex = -1
+	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 
 	rf.log = make([]LogEntry, 0)
