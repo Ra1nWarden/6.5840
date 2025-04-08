@@ -273,7 +273,7 @@ func (rf *Raft) maybeApply() {
 			CommandIndex: rf.lastApplied,
 		}
 		rf.mu.Unlock()
-		DPrintf("MaybeApply(%v)", msg)
+		DPrintf("Server %d MaybeApply(%v)", rf.me, msg)
 		rf.applyCh <- msg
 		rf.maybeApply()
 	} else {
@@ -343,7 +343,7 @@ func (rf *Raft) sendHeartBeats() {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-	DPrintf("Snapshot is called on %d", rf.me)
+	DPrintf("Snapshot is called on %d for index %d lastincluded %d lastapplied %d", rf.me, index, rf.lastIncludedIndex, rf.lastApplied)
 	rf.mu.Lock()
 	if index <= rf.lastIncludedIndex {
 		rf.mu.Unlock()
@@ -367,7 +367,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.commitIndex = index
 	}
 	rf.mu.Unlock()
-	DPrintf("Snapshot is finished on %d", rf.me)
+	DPrintf("Snapshot is finished on %d for index %d", rf.me, index)
 }
 
 // InstallSnapshot RPC
@@ -392,7 +392,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	if args.LastIncludedIndex < rf.lastIncludedIndex {
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		rf.mu.Unlock()
 		return
 	}
@@ -432,21 +432,23 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	rf.persist()
+	valid := false
 	if args.LastIncludedIndex > rf.lastApplied {
 		rf.lastApplied = args.LastIncludedIndex
+		valid = true
 	}
 	if args.LastIncludedIndex > rf.commitIndex {
 		rf.commitIndex = args.LastIncludedIndex
 	}
 
 	msg := ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      rf.snapshot,
-		SnapshotTerm:  rf.lastIncludedTerm,
-		SnapshotIndex: rf.lastIncludedIndex,
+		SnapshotValid: valid,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
 	}
 	rf.mu.Unlock()
-	DPrintf("InstallSnapshot(%v)", msg)
+	DPrintf("Server %d InstallSnapshot(%v)", rf.me, msg)
 	rf.applyCh <- msg
 }
 
@@ -885,6 +887,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.ReadSnapshot()
+
+	if rf.snapshot != nil {
+		rf.commitIndex = rf.lastIncludedIndex
+		rf.lastApplied = rf.lastIncludedIndex
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
