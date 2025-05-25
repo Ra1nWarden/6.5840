@@ -766,7 +766,7 @@ func (rf *Raft) startReplication(index int, term int) {
 		}
 
 		// Sleep if not finished
-		time.Sleep(time.Duration(200) * time.Millisecond)
+		time.Sleep(time.Duration(10) * time.Millisecond)
 	}
 }
 
@@ -849,7 +849,7 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 100)
+		ms := 50 + (rand.Int63() % 50)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
