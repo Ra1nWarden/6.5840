@@ -644,6 +644,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	argsPrevLogIndexTrimmed := args.PrevLogIndex - rf.lastIncludedIndex
 
+	if argsPrevLogIndexTrimmed < 0 {
+		reply.Success = false
+		reply.RejectedTermFirstIndex = rf.lastIncludedIndex + 1
+		return
+	}
+
 	if args.PrevLogTerm != rf.getLogTerm(argsPrevLogIndexTrimmed) {
 		reply.Success = false
 		rejectedTerm := rf.getLogTerm(argsPrevLogIndexTrimmed)
