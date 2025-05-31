@@ -204,6 +204,7 @@ func (kv *KVServer) applySnapshot(snapshot []byte) bool {
 		kv.prevRequest = prevRequest
 		kv.prevResponse = prevResponse
 		kv.rf.Snapshot(kv.latestIndex, snapshot)
+		kv.persister.Save(kv.persister.ReadRaftState(), snapshot)
 		return true
 	}
 }
@@ -228,7 +229,8 @@ func (kv *KVServer) ticker() {
 			kv.term = term
 			kv.isLeader = isLeader
 			kv.cond.Broadcast()
-		} else if kv.maxraftstate != -1 && kv.persister.RaftStateSize()+100 > kv.maxraftstate {
+		}
+		if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 			snapshot := kv.saveSnapshot()
 			kv.rf.Snapshot(kv.latestIndex, snapshot)
 			kv.persister.Save(kv.persister.ReadRaftState(), snapshot)

@@ -272,8 +272,8 @@ func (rf *Raft) maybeApply() {
 			Command:      rf.log[lastAppliedTrimmed].Command,
 			CommandIndex: rf.lastApplied,
 		}
-		rf.mu.Unlock()
 		DPrintf("Server %d MaybeApply(%v)", rf.me, msg)
+		rf.mu.Unlock()
 		rf.applyCh <- msg
 		rf.maybeApply()
 	} else {
@@ -308,8 +308,8 @@ func (rf *Raft) startElectionWithArgs(args *RequestVoteArgs) {
 			votes++
 		}
 		if votes > len(rf.peers)/2 {
-			DPrintf("%d won election term %d\n", args.CandidateId, args.Term)
 			rf.mu.Lock()
+			DPrintf("%d won election term %d\n", args.CandidateId, args.Term)
 			if rf.role == Candidate && rf.currentTerm == args.Term {
 				rf.transitRole(Leader)
 				rf.sendHeartBeats()
@@ -343,8 +343,8 @@ func (rf *Raft) sendHeartBeats() {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-	DPrintf("Snapshot is called on %d for index %d lastincluded %d lastapplied %d", rf.me, index, rf.lastIncludedIndex, rf.lastApplied)
 	rf.mu.Lock()
+	DPrintf("Snapshot is called on %d for index %d lastincluded %d lastapplied %d", rf.me, index, rf.lastIncludedIndex, rf.lastApplied)
 	if index <= rf.lastIncludedIndex {
 		rf.mu.Unlock()
 		return
@@ -366,8 +366,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index > rf.commitIndex {
 		rf.commitIndex = index
 	}
-	rf.mu.Unlock()
 	DPrintf("Snapshot is finished on %d for index %d", rf.me, index)
+	rf.mu.Unlock()
 }
 
 // InstallSnapshot RPC
@@ -447,8 +447,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-	rf.mu.Unlock()
 	DPrintf("Server %d InstallSnapshot(%v)", rf.me, msg)
+	rf.mu.Unlock()
 	rf.applyCh <- msg
 }
 
