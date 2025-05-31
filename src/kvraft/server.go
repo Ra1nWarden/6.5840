@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -41,6 +42,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister    *raft.Persister
 	cond         *sync.Cond
 	data         map[string]string
 	prevRequest  map[int64]int64
@@ -48,6 +50,15 @@ type KVServer struct {
 	latestIndex  int
 	term         int
 	isLeader     bool
+}
+
+type Snapshot struct {
+	Data         map[string]string
+	LatestIndex  int
+	Term         int
+	IsLeader     bool
+	PrevRequest  map[int64]int64
+	PrevResponse map[int64]string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -144,25 +155,69 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) apply() {
 	for msg := range kv.applyCh {
 		DPrintf("apply in %d: %v\n", kv.me, msg)
-		command := msg.Command.(Op)
-		kv.mu.Lock()
-		kv.latestIndex = msg.CommandIndex
-		kv.cond.Broadcast()
-		if kv.prevRequest[command.ClientId] == command.RequestId {
+		if msg.CommandValid {
+			command := msg.Command.(Op)
+			kv.mu.Lock()
+			kv.latestIndex = msg.CommandIndex
+			kv.cond.Broadcast()
+			if kv.prevRequest[command.ClientId] == command.RequestId {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.prevRequest[command.ClientId] = command.RequestId
+			switch command.Operation {
+			case "Put":
+				kv.data[command.Key] = command.Value
+			case "Append":
+				kv.data[command.Key] += command.Value
+			case "Get":
+				kv.prevResponse[command.ClientId] = kv.data[command.Key]
+			}
 			kv.mu.Unlock()
-			continue
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.applySnapshot(msg.Snapshot) {
+				kv.cond.Broadcast()
+			}
+			kv.mu.Unlock()
 		}
-		kv.prevRequest[command.ClientId] = command.RequestId
-		switch command.Operation {
-		case "Put":
-			kv.data[command.Key] = command.Value
-		case "Append":
-			kv.data[command.Key] += command.Value
-		case "Get":
-			kv.prevResponse[command.ClientId] = kv.data[command.Key]
-		}
-		kv.mu.Unlock()
 	}
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte) bool {
+	reader := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(reader)
+	var data map[string]string
+	var latestIndex int
+	var term int
+	var isLeader bool
+	var prevRequest map[int64]int64
+	var prevResponse map[int64]string
+	if decoder.Decode(&data) != nil || decoder.Decode(&latestIndex) != nil || decoder.Decode(&term) != nil || decoder.Decode(&isLeader) != nil || decoder.Decode(&prevRequest) != nil || decoder.Decode(&prevResponse) != nil {
+		DPrintf("Decode error")
+		return false
+	} else {
+		kv.data = data
+		kv.latestIndex = latestIndex
+		kv.term = term
+		kv.isLeader = isLeader
+		kv.prevRequest = prevRequest
+		kv.prevResponse = prevResponse
+		kv.rf.Snapshot(kv.latestIndex, snapshot)
+		return true
+	}
+}
+
+func (kv *KVServer) saveSnapshot() []byte {
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(kv.data)
+	encoder.Encode(kv.latestIndex)
+	encoder.Encode(kv.term)
+	encoder.Encode(kv.isLeader)
+	encoder.Encode(kv.prevRequest)
+	encoder.Encode(kv.prevResponse)
+	return writer.Bytes()
 }
 
 func (kv *KVServer) ticker() {
@@ -173,6 +228,10 @@ func (kv *KVServer) ticker() {
 			kv.term = term
 			kv.isLeader = isLeader
 			kv.cond.Broadcast()
+		} else if kv.maxraftstate != -1 && kv.persister.RaftStateSize()+100 > kv.maxraftstate {
+			snapshot := kv.saveSnapshot()
+			kv.rf.Snapshot(kv.latestIndex, snapshot)
+			kv.persister.Save(kv.persister.ReadRaftState(), snapshot)
 		}
 		kv.mu.Unlock()
 		time.Sleep(100 * time.Millisecond)
@@ -223,16 +282,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.cond = sync.NewCond(&kv.mu)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.persister = persister
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.data = make(map[string]string)
-	kv.prevRequest = make(map[int64]int64)
-	kv.prevResponse = make(map[int64]string)
-
-	kv.latestIndex = 0
-	kv.term = 0
-	kv.isLeader = false
+	if kv.persister.ReadSnapshot() == nil || !kv.applySnapshot(kv.persister.ReadSnapshot()) {
+		kv.data = make(map[string]string)
+		kv.prevRequest = make(map[int64]int64)
+		kv.prevResponse = make(map[int64]string)
+		kv.latestIndex = 0
+		kv.term = 0
+		kv.isLeader = false
+	}
 
 	go kv.apply()
 	go kv.ticker()
