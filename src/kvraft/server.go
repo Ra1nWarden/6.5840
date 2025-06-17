@@ -57,6 +57,22 @@ type Snapshot struct {
 	PrevResponse map[int64]string
 }
 
+func (kv *KVServer) waitForSuccessfulCommit(term int, index int) bool {
+	for {
+		newTerm, newIsLeader := kv.rf.GetState()
+		if newTerm != term || !newIsLeader {
+			return false
+		}
+		if kv.latestIndex > index {
+			return false
+		} else if kv.latestIndex == index {
+			return true
+		}
+		kv.cond.Wait()
+	}
+
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
@@ -77,21 +93,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	for {
-		newTerm, newIsLeader := kv.rf.GetState()
-		if newTerm != term || !newIsLeader {
-			reply.Err = ErrWrongLeader
-			break
-		}
-		if kv.latestIndex > index {
-			reply.Err = ErrWrongLeader
-			break
-		} else if kv.latestIndex == index {
-			reply.Err = OK
-			reply.Value = kv.data[args.Key]
-			break
-		}
-		kv.cond.Wait()
+	if !kv.waitForSuccessfulCommit(term, index) {
+		reply.Err = ErrWrongLeader
+		return
+	} else {
+		reply.Err = OK
+		reply.Value = kv.data[args.Key]
+		return
 	}
 }
 
@@ -107,20 +115,12 @@ func (kv *KVServer) PutAppend(command Op, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	for {
-		newTerm, newIsLeader := kv.rf.GetState()
-		if newTerm != term || !newIsLeader {
-			reply.Err = ErrWrongLeader
-			break
-		}
-		if kv.latestIndex > index {
-			reply.Err = ErrWrongLeader
-			break
-		} else if kv.latestIndex == index {
-			reply.Err = OK
-			break
-		}
-		kv.cond.Wait()
+	if !kv.waitForSuccessfulCommit(term, index) {
+		reply.Err = ErrWrongLeader
+		return
+	} else {
+		reply.Err = OK
+		return
 	}
 }
 
