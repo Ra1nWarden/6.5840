@@ -48,15 +48,11 @@ type KVServer struct {
 	prevRequest  map[int64]int64
 	prevResponse map[int64]string
 	latestIndex  int
-	term         int
-	isLeader     bool
 }
 
 type Snapshot struct {
 	Data         map[string]string
 	LatestIndex  int
-	Term         int
-	IsLeader     bool
 	PrevRequest  map[int64]int64
 	PrevResponse map[int64]string
 }
@@ -82,8 +78,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	for {
-		DPrintf("handle get in %d (%v): %v vs %v, %v vs %v, %v vs %v\n", kv.me, op, term, kv.term, isLeader, kv.isLeader, index, kv.latestIndex)
-		if kv.term != term || !kv.isLeader {
+		newTerm, newIsLeader := kv.rf.GetState()
+		if newTerm != term || !newIsLeader {
 			reply.Err = ErrWrongLeader
 			break
 		}
@@ -112,8 +108,8 @@ func (kv *KVServer) PutAppend(command Op, reply *PutAppendReply) {
 		return
 	}
 	for {
-		DPrintf("handle putappend in %d (%v): %v vs %v, %v vs %v, %v vs %v\n", kv.me, command, term, kv.term, isLeader, kv.isLeader, index, kv.latestIndex)
-		if kv.term != term || !kv.isLeader {
+		newTerm, newIsLeader := kv.rf.GetState()
+		if newTerm != term || !newIsLeader {
 			reply.Err = ErrWrongLeader
 			break
 		}
@@ -189,18 +185,14 @@ func (kv *KVServer) applySnapshot(snapshot []byte) bool {
 	decoder := labgob.NewDecoder(reader)
 	var data map[string]string
 	var latestIndex int
-	var term int
-	var isLeader bool
 	var prevRequest map[int64]int64
 	var prevResponse map[int64]string
-	if decoder.Decode(&data) != nil || decoder.Decode(&latestIndex) != nil || decoder.Decode(&term) != nil || decoder.Decode(&isLeader) != nil || decoder.Decode(&prevRequest) != nil || decoder.Decode(&prevResponse) != nil {
+	if decoder.Decode(&data) != nil || decoder.Decode(&latestIndex) != nil || decoder.Decode(&prevRequest) != nil || decoder.Decode(&prevResponse) != nil {
 		DPrintf("Decode error")
 		return false
 	} else {
 		kv.data = data
 		kv.latestIndex = latestIndex
-		kv.term = term
-		kv.isLeader = isLeader
 		kv.prevRequest = prevRequest
 		kv.prevResponse = prevResponse
 		kv.rf.Snapshot(kv.latestIndex, snapshot)
@@ -214,8 +206,6 @@ func (kv *KVServer) saveSnapshot() []byte {
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(kv.data)
 	encoder.Encode(kv.latestIndex)
-	encoder.Encode(kv.term)
-	encoder.Encode(kv.isLeader)
 	encoder.Encode(kv.prevRequest)
 	encoder.Encode(kv.prevResponse)
 	return writer.Bytes()
@@ -224,12 +214,7 @@ func (kv *KVServer) saveSnapshot() []byte {
 func (kv *KVServer) ticker() {
 	for !kv.killed() {
 		kv.mu.Lock()
-		term, isLeader := kv.rf.GetState()
-		if kv.term != term || kv.isLeader != isLeader {
-			kv.term = term
-			kv.isLeader = isLeader
-			kv.cond.Broadcast()
-		}
+		kv.cond.Broadcast()
 		if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 			snapshot := kv.saveSnapshot()
 			kv.rf.Snapshot(kv.latestIndex, snapshot)
@@ -293,8 +278,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		kv.prevRequest = make(map[int64]int64)
 		kv.prevResponse = make(map[int64]string)
 		kv.latestIndex = 0
-		kv.term = 0
-		kv.isLeader = false
 	}
 
 	go kv.apply()
