@@ -30,8 +30,6 @@ type ShardCtrler struct {
 	prevRequest  map[int64]int64
 	prevResponse map[int64]Config
 	latestIndex  int
-	term         int
-	isLeader     bool
 
 	configs []Config // indexed by config num
 }
@@ -40,11 +38,27 @@ type Op struct {
 	// Your data here.
 	Operation string
 	Servers   map[int][]string
+	GIDs      []int
 	Num       int
 	GID       int
 	Shard     int
 	RequestId int64
 	ClientId  int64
+}
+
+func (sc *ShardCtrler) waitForSuccessfulCommit(term int, index int) bool {
+	for {
+		newTerm, newIsLeader := sc.rf.GetState()
+		if newTerm != term || !newIsLeader {
+			return false
+		}
+		if sc.latestIndex > index {
+			return false
+		} else if sc.latestIndex == index {
+			return true
+		}
+		sc.cond.Wait()
+	}
 }
 
 // This helper function takes a groups mapping and current shard allocation,
@@ -107,41 +121,143 @@ func rebalance(shards [NShards]int, groups map[int][]string) [NShards]int {
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	newConfig := Config{
-		Num:    len(sc.configs),
-		Shards: [NShards]int{},
-		Groups: make(map[int][]string),
+	op := Op{
+		Operation: "Join",
+		Servers:   args.Servers,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
 	}
-
-	lastConfig := sc.configs[len(sc.configs)-1]
-
-	for gid, servers := range lastConfig.Groups {
-		newConfig.Groups[gid] = servers
+	index, term, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		return
 	}
-
-	for gid, servers := range args.Servers {
-		newConfig.Groups[gid] = servers
+	if !sc.waitForSuccessfulCommit(term, index) {
+		reply.WrongLeader = true
+		return
+	} else {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
 	}
-
-	newConfig.Shards = rebalance(lastConfig.Shards, newConfig.Groups)
-
-	sc.configs = append(sc.configs, newConfig)
 
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+	op := Op{
+		Operation: "Leave",
+		GIDs:      args.GIDs,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+	index, term, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	if !sc.waitForSuccessfulCommit(term, index) {
+		reply.WrongLeader = true
+		return
+	} else {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	op := Op{
+		Operation: "Move",
+		Shard:     args.Shard,
+		GID:       args.GID,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+	index, term, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	if !sc.waitForSuccessfulCommit(term, index) {
+		reply.WrongLeader = true
+		return
+	} else {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
+	op := Op{
+		Operation: "Query",
+		Num:       args.Num,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+	index, term, isLeader := sc.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	if !sc.waitForSuccessfulCommit(term, index) {
+		reply.WrongLeader = true
+		return
+	} else {
+		reply.WrongLeader = false
+		reply.Err = OK
+		index := args.Num
+		if index == -1 || index >= len(sc.configs) {
+			index = len(sc.configs) - 1
+		}
+		reply.Config = sc.configs[index]
+		return
+	}
+}
+
+func (sc *ShardCtrler) apply() {
+	for msg := range sc.applyCh {
+		if msg.CommandValid {
+			command := msg.Command.(Op)
+			sc.mu.Lock()
+			sc.latestIndex = msg.CommandIndex
+			sc.cond.Broadcast()
+			if sc.prevRequest[command.ClientId] == command.RequestId {
+				sc.mu.Unlock()
+				continue
+			}
+			sc.prevRequest[command.ClientId] = command.RequestId
+			switch command.Operation {
+			case "Join":
+				newConfig := Config{
+					Num:    len(sc.configs),
+					Shards: [NShards]int{},
+					Groups: make(map[int][]string),
+				}
+
+				lastConfig := sc.configs[len(sc.configs)-1]
+
+				for gid, servers := range lastConfig.Groups {
+					newConfig.Groups[gid] = servers
+				}
+
+				for gid, servers := range command.Servers {
+					newConfig.Groups[gid] = servers
+				}
+
+				newConfig.Shards = rebalance(lastConfig.Shards, newConfig.Groups)
+
+				sc.configs = append(sc.configs, newConfig)
+			case "Leave":
+			case "Move":
+			case "Query":
+			}
+			sc.mu.Unlock()
+		}
+	}
 }
 
 // the tester calls Kill() when a ShardCtrler instance won't
@@ -174,6 +290,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
+
+	sc.cond = sync.NewCond(&sc.mu)
+	sc.prevRequest = make(map[int64]int64)
+	sc.prevResponse = make(map[int64]Config)
+	sc.latestIndex = 0
+
+	go sc.apply()
 
 	return sc
 }
