@@ -63,10 +63,13 @@ func (sc *ShardCtrler) waitForSuccessfulCommit(term int, index int) bool {
 
 // This helper function takes a groups mapping and current shard allocation,
 // and returns a new shard allocation that is balanced.
-func rebalance(shards [NShards]int, groups map[int][]string) [NShards]int {
+func (config *Config) rebalance() {
+	if len(config.Groups) == 0 {
+		return
+	}
 	allocation := make(map[int]int)
-	gids := make([]int, 0, len(groups))
-	for gid := range groups {
+	gids := make([]int, 0, len(config.Groups))
+	for gid := range config.Groups {
 		allocation[gid] = 0
 		gids = append(gids, gid)
 	}
@@ -74,12 +77,12 @@ func rebalance(shards [NShards]int, groups map[int][]string) [NShards]int {
 
 	result := [NShards]int{}
 
-	baseAllocation := len(shards) / len(groups)
-	remainder := len(shards) % len(groups)
+	baseAllocation := len(config.Shards) / len(config.Groups)
+	remainder := len(config.Shards) % len(config.Groups)
 
 	queue := []int{}
 
-	for shard, gid := range shards {
+	for shard, gid := range config.Shards {
 		_, ok := allocation[gid]
 		if !ok {
 			result[shard] = 0
@@ -115,12 +118,18 @@ func rebalance(shards [NShards]int, groups map[int][]string) [NShards]int {
 		}
 	}
 
-	return result
-
+	config.Shards = result
 }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.prevRequest[args.ClientId] == args.RequestId {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
 	op := Op{
 		Operation: "Join",
 		Servers:   args.Servers,
@@ -145,6 +154,13 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.prevRequest[args.ClientId] == args.RequestId {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
 	op := Op{
 		Operation: "Leave",
 		GIDs:      args.GIDs,
@@ -168,6 +184,13 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.prevRequest[args.ClientId] == args.RequestId {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
 	op := Op{
 		Operation: "Move",
 		Shard:     args.Shard,
@@ -192,6 +215,13 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.prevRequest[args.ClientId] == args.RequestId {
+		reply.WrongLeader = false
+		reply.Err = OK
+		return
+	}
 	op := Op{
 		Operation: "Query",
 		Num:       args.Num,
@@ -209,13 +239,27 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	} else {
 		reply.WrongLeader = false
 		reply.Err = OK
-		index := args.Num
-		if index == -1 || index >= len(sc.configs) {
-			index = len(sc.configs) - 1
-		}
-		reply.Config = sc.configs[index]
+		reply.Config = sc.prevResponse[args.ClientId]
 		return
 	}
+}
+
+func (sc *ShardCtrler) copyFromLastConfig() *Config {
+	lastConfig := sc.configs[len(sc.configs)-1]
+
+	newConfig := Config{
+		Num:    len(sc.configs),
+		Shards: lastConfig.Shards,
+		Groups: make(map[int][]string),
+	}
+
+	for gid, servers := range lastConfig.Groups {
+		newConfig.Groups[gid] = servers
+	}
+
+	sc.configs = append(sc.configs, newConfig)
+
+	return &sc.configs[len(sc.configs)-1]
 }
 
 func (sc *ShardCtrler) apply() {
@@ -232,28 +276,34 @@ func (sc *ShardCtrler) apply() {
 			sc.prevRequest[command.ClientId] = command.RequestId
 			switch command.Operation {
 			case "Join":
-				newConfig := Config{
-					Num:    len(sc.configs),
-					Shards: [NShards]int{},
-					Groups: make(map[int][]string),
-				}
-
-				lastConfig := sc.configs[len(sc.configs)-1]
-
-				for gid, servers := range lastConfig.Groups {
-					newConfig.Groups[gid] = servers
-				}
+				newConfig := sc.copyFromLastConfig()
 
 				for gid, servers := range command.Servers {
 					newConfig.Groups[gid] = servers
 				}
 
-				newConfig.Shards = rebalance(lastConfig.Shards, newConfig.Groups)
+				newConfig.rebalance()
 
-				sc.configs = append(sc.configs, newConfig)
 			case "Leave":
+				newConfig := sc.copyFromLastConfig()
+
+				for _, gid := range command.GIDs {
+					delete(newConfig.Groups, gid)
+				}
+
+				newConfig.rebalance()
+
 			case "Move":
+				newConfig := sc.copyFromLastConfig()
+
+				newConfig.Shards[command.Shard] = command.GID
+
 			case "Query":
+				index := command.Num
+				if index == -1 || index >= len(sc.configs) {
+					index = len(sc.configs) - 1
+				}
+				sc.prevResponse[command.ClientId] = sc.configs[index]
 			}
 			sc.mu.Unlock()
 		}
@@ -295,6 +345,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.prevRequest = make(map[int64]int64)
 	sc.prevResponse = make(map[int64]Config)
 	sc.latestIndex = 0
+
+	sc.configs[0].Num = 0
+	sc.configs[0].Shards = [NShards]int{}
 
 	go sc.apply()
 
