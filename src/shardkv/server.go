@@ -1,17 +1,35 @@
 package shardkv
 
+import (
+	"bytes"
+	"log"
+	"sync"
+	"time"
 
-import "6.5840/labrpc"
-import "6.5840/raft"
-import "sync"
-import "6.5840/labgob"
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
+	"6.5840/shardctrler"
+)
 
+const Debug = false
 
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Operation string
+	Key       string
+	Value     string
+	RequestId int64
+	ClientId  int64
 }
 
 type ShardKV struct {
@@ -25,15 +43,120 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister    *raft.Persister
+	cond         *sync.Cond
+	data         map[string]string
+	prevRequest  map[int64]int64
+	prevResponse map[int64]string
+	latestIndex  int
+
+	// Shard-specific fields
+	mck    *shardctrler.Clerk
+	config shardctrler.Config
 }
 
+type Snapshot struct {
+	Data         map[string]string
+	LatestIndex  int
+	PrevRequest  map[int64]int64
+	PrevResponse map[int64]string
+	Config       shardctrler.Config
+}
+
+func (kv *ShardKV) waitForSuccessfulCommit(term int, index int) bool {
+	for {
+		newTerm, newIsLeader := kv.rf.GetState()
+		if newTerm != term || !newIsLeader {
+			return false
+		}
+		if kv.latestIndex > index {
+			return false
+		} else if kv.latestIndex == index {
+			return true
+		}
+		kv.cond.Wait()
+	}
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// Check if this key belongs to our shoard
+	kv.config = kv.mck.Query(-1)
+	if kv.config.Shards[key2shard(args.Key)] != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	// Check for duplicate request
+	if kv.prevRequest[args.ClientId] == args.RequestId {
+		reply.Err = OK
+		reply.Value = kv.prevResponse[args.ClientId]
+		return
+	}
+
+	op := Op{
+		Operation: "Get",
+		Key:       args.Key,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	if !kv.waitForSuccessfulCommit(term, index) {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	reply.Err = OK
+	reply.Value = kv.data[args.Key]
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// Check if this key belongs to our shard
+	kv.config = kv.mck.Query(-1)
+	if kv.config.Shards[key2shard(args.Key)] != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	// Check for duplicate request
+	if kv.prevRequest[args.ClientId] == args.RequestId {
+		reply.Err = OK
+		return
+	}
+
+	op := Op{
+		Operation: args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	if !kv.waitForSuccessfulCommit(term, index) {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	reply.Err = OK
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -45,6 +168,88 @@ func (kv *ShardKV) Kill() {
 	// Your code here, if desired.
 }
 
+func (kv *ShardKV) apply() {
+	for msg := range kv.applyCh {
+		DPrintf("apply in %d: %v\n", kv.me, msg)
+		if msg.CommandValid {
+			command := msg.Command.(Op)
+			kv.mu.Lock()
+			kv.latestIndex = msg.CommandIndex
+			kv.cond.Broadcast()
+			if kv.prevRequest[command.ClientId] == command.RequestId {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.prevRequest[command.ClientId] = command.RequestId
+			switch command.Operation {
+			case "Put":
+				kv.data[command.Key] = command.Value
+			case "Append":
+				kv.data[command.Key] += command.Value
+			case "Get":
+				kv.prevResponse[command.ClientId] = kv.data[command.Key]
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.applySnapshot(msg.Snapshot) {
+				kv.cond.Broadcast()
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func (kv *ShardKV) applySnapshot(snapshot []byte) bool {
+	reader := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(reader)
+	var data map[string]string
+	var latestIndex int
+	var prevRequest map[int64]int64
+	var prevResponse map[int64]string
+	var config shardctrler.Config
+	if decoder.Decode(&data) != nil || decoder.Decode(&latestIndex) != nil ||
+		decoder.Decode(&prevRequest) != nil || decoder.Decode(&prevResponse) != nil ||
+		decoder.Decode(&config) != nil {
+		DPrintf("Decode error")
+		return false
+	} else {
+		kv.data = data
+		kv.latestIndex = latestIndex
+		kv.prevRequest = prevRequest
+		kv.prevResponse = prevResponse
+		kv.config = config
+		kv.rf.Snapshot(kv.latestIndex, snapshot)
+		kv.persister.Save(kv.persister.ReadRaftState(), snapshot)
+		return true
+	}
+}
+
+func (kv *ShardKV) saveSnapshot() []byte {
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(kv.data)
+	encoder.Encode(kv.latestIndex)
+	encoder.Encode(kv.prevRequest)
+	encoder.Encode(kv.prevResponse)
+	encoder.Encode(kv.config)
+	return writer.Bytes()
+}
+
+func (kv *ShardKV) ticker() {
+	for {
+		kv.mu.Lock()
+		kv.config = kv.mck.Query(-1)
+		kv.cond.Broadcast()
+		if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+			snapshot := kv.saveSnapshot()
+			kv.rf.Snapshot(kv.latestIndex, snapshot)
+			kv.persister.Save(kv.persister.ReadRaftState(), snapshot)
+		}
+		kv.mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 
 // servers[] contains the ports of the servers in this group.
 //
@@ -85,13 +290,25 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
-
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
+	kv.cond = sync.NewCond(&kv.mu)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.persister = persister
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	// Use something like this to talk to the shardctrler:
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+
+	// Initialize data structures
+	if kv.persister.ReadSnapshot() == nil || !kv.applySnapshot(kv.persister.ReadSnapshot()) {
+		kv.data = make(map[string]string)
+		kv.prevRequest = make(map[int64]int64)
+		kv.prevResponse = make(map[int64]string)
+		kv.latestIndex = 0
+		kv.config = shardctrler.Config{}
+	}
+
+	go kv.apply()
+	go kv.ticker()
 
 	return kv
 }
