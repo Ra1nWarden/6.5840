@@ -114,7 +114,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
-				DPrintf("put server %v %v %v %v", key, value, op, srv)
+				DPrintf("put server %v %v %v %v", key, value, op, servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				DPrintf("rpc return %v and reply %v", ok, reply)

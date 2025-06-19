@@ -220,6 +220,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	if sc.prevRequest[args.ClientId] == args.RequestId {
 		reply.WrongLeader = false
 		reply.Err = OK
+		reply.Config = sc.prevResponse[args.ClientId]
 		return
 	}
 	op := Op{

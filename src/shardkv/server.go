@@ -63,39 +63,10 @@ type Snapshot struct {
 	Config       shardctrler.Config
 }
 
-func (kv *ShardKV) waitForSuccessfulCommit(term int, index int) bool {
-	for {
-		newTerm, newIsLeader := kv.rf.GetState()
-		if newTerm != term || !newIsLeader {
-			return false
-		}
-		if kv.latestIndex > index {
-			return false
-		} else if kv.latestIndex == index {
-			return true
-		}
-		kv.cond.Wait()
-	}
-}
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
-	// Check if this key belongs to our shoard
-	kv.config = kv.mck.Query(-1)
-	if kv.config.Shards[key2shard(args.Key)] != kv.gid {
-		reply.Err = ErrWrongGroup
-		return
-	}
-
-	// Check for duplicate request
-	if kv.prevRequest[args.ClientId] == args.RequestId {
-		reply.Err = OK
-		reply.Value = kv.prevResponse[args.ClientId]
-		return
-	}
 
 	op := Op{
 		Operation: "Get",
@@ -110,32 +81,32 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	if !kv.waitForSuccessfulCommit(term, index) {
-		reply.Err = ErrWrongLeader
-		return
+	for {
+		newTerm, newIsLeader := kv.rf.GetState()
+		if newTerm != term || !newIsLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		if kv.latestIndex > index {
+			reply.Err = ErrWrongLeader
+			return
+		} else if kv.latestIndex == index {
+			if kv.config.Shards[key2shard(args.Key)] != kv.gid {
+				reply.Err = ErrWrongGroup
+				return
+			}
+			reply.Err = OK
+			reply.Value = kv.data[args.Key]
+			return
+		}
+		kv.cond.Wait()
 	}
-
-	reply.Err = OK
-	reply.Value = kv.data[args.Key]
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
-	// Check if this key belongs to our shard
-	kv.config = kv.mck.Query(-1)
-	if kv.config.Shards[key2shard(args.Key)] != kv.gid {
-		reply.Err = ErrWrongGroup
-		return
-	}
-
-	// Check for duplicate request
-	if kv.prevRequest[args.ClientId] == args.RequestId {
-		reply.Err = OK
-		return
-	}
 
 	op := Op{
 		Operation: args.Op,
@@ -151,12 +122,25 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if !kv.waitForSuccessfulCommit(term, index) {
-		reply.Err = ErrWrongLeader
-		return
+	for {
+		newTerm, newIsLeader := kv.rf.GetState()
+		if newTerm != term || !newIsLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		if kv.latestIndex > index {
+			reply.Err = ErrWrongLeader
+			return
+		} else if kv.latestIndex == index {
+			if kv.config.Shards[key2shard(args.Key)] != kv.gid {
+				reply.Err = ErrWrongGroup
+				return
+			}
+			reply.Err = OK
+			return
+		}
+		kv.cond.Wait()
 	}
-
-	reply.Err = OK
 }
 
 // the tester calls Kill() when a ShardKV instance won't
@@ -170,7 +154,7 @@ func (kv *ShardKV) Kill() {
 
 func (kv *ShardKV) apply() {
 	for msg := range kv.applyCh {
-		DPrintf("apply in %d: %v\n", kv.me, msg)
+		//DPrintf("apply in %d: %v\n", kv.me, msg)
 		if msg.CommandValid {
 			command := msg.Command.(Op)
 			kv.mu.Lock()
@@ -181,6 +165,12 @@ func (kv *ShardKV) apply() {
 				continue
 			}
 			kv.prevRequest[command.ClientId] = command.RequestId
+			kv.config = kv.mck.Query(-1)
+			if kv.config.Shards[key2shard(command.Key)] != kv.gid {
+				DPrintf("wrong group %d %d config is %v\n", kv.config.Shards[key2shard(command.Key)], kv.gid, kv.config)
+				kv.mu.Unlock()
+				continue
+			}
 			switch command.Operation {
 			case "Put":
 				kv.data[command.Key] = command.Value
@@ -211,7 +201,6 @@ func (kv *ShardKV) applySnapshot(snapshot []byte) bool {
 	if decoder.Decode(&data) != nil || decoder.Decode(&latestIndex) != nil ||
 		decoder.Decode(&prevRequest) != nil || decoder.Decode(&prevResponse) != nil ||
 		decoder.Decode(&config) != nil {
-		DPrintf("Decode error")
 		return false
 	} else {
 		kv.data = data
