@@ -4,6 +4,7 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -47,17 +48,25 @@ type Op struct {
 }
 
 func (sc *ShardCtrler) waitForSuccessfulCommit(term int, index int) bool {
+	timeout := time.After(10 * time.Second) // 10 second timeout
+	startTime := time.Now()
 	for {
-		newTerm, newIsLeader := sc.rf.GetState()
-		if newTerm != term || !newIsLeader {
+		select {
+		case <-timeout:
+			DPrintf("ShardCtrler %d: waitForSuccessfulCommit timeout after %v for index %d", sc.me, time.Since(startTime), index)
 			return false
+		default:
+			newTerm, newIsLeader := sc.rf.GetState()
+			if newTerm != term || !newIsLeader {
+				DPrintf("ShardCtrler %d: leader changed or term changed, giving up", sc.me)
+				return false
+			}
+			if sc.latestIndex >= index {
+				DPrintf("ShardCtrler %d: commit successful for index %d", sc.me, index)
+				return true
+			}
+			sc.cond.Wait()
 		}
-		if sc.latestIndex > index {
-			return false
-		} else if sc.latestIndex == index {
-			return true
-		}
-		sc.cond.Wait()
 	}
 }
 

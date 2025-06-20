@@ -63,6 +63,29 @@ type Snapshot struct {
 	Config       shardctrler.Config
 }
 
+func (kv *ShardKV) waitForSuccessfulCommit(term int, index int) bool {
+	timeout := time.After(10 * time.Second) // 10 second timeout
+	startTime := time.Now()
+	for {
+		select {
+		case <-timeout:
+			DPrintf("ShardKV %d: waitForSuccessfulCommit timeout after %v for index %d", kv.me, time.Since(startTime), index)
+			return false
+		default:
+			newTerm, newIsLeader := kv.rf.GetState()
+			if newTerm != term || !newIsLeader {
+				DPrintf("ShardKV %d: leader changed or term changed, giving up", kv.me)
+				return false
+			}
+			if kv.latestIndex >= index {
+				DPrintf("ShardKV %d: commit successful for index %d", kv.me, index)
+				return true
+			}
+			kv.cond.Wait()
+		}
+	}
+}
+
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
@@ -81,26 +104,17 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	for {
-		newTerm, newIsLeader := kv.rf.GetState()
-		if newTerm != term || !newIsLeader {
-			reply.Err = ErrWrongLeader
-			return
-		}
-		if kv.latestIndex > index {
-			reply.Err = ErrWrongLeader
-			return
-		} else if kv.latestIndex == index {
-			if kv.config.Shards[key2shard(args.Key)] != kv.gid {
-				reply.Err = ErrWrongGroup
-				return
-			}
-			reply.Err = OK
-			reply.Value = kv.data[args.Key]
-			return
-		}
-		kv.cond.Wait()
+	if !kv.waitForSuccessfulCommit(term, index) {
+		reply.Err = ErrWrongLeader
+		return
 	}
+
+	if kv.config.Shards[key2shard(args.Key)] != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	reply.Err = OK
+	reply.Value = kv.data[args.Key]
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -122,25 +136,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	for {
-		newTerm, newIsLeader := kv.rf.GetState()
-		if newTerm != term || !newIsLeader {
-			reply.Err = ErrWrongLeader
-			return
-		}
-		if kv.latestIndex > index {
-			reply.Err = ErrWrongLeader
-			return
-		} else if kv.latestIndex == index {
-			if kv.config.Shards[key2shard(args.Key)] != kv.gid {
-				reply.Err = ErrWrongGroup
-				return
-			}
-			reply.Err = OK
-			return
-		}
-		kv.cond.Wait()
+	if !kv.waitForSuccessfulCommit(term, index) {
+		reply.Err = ErrWrongLeader
+		return
 	}
+
+	if kv.config.Shards[key2shard(args.Key)] != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+	reply.Err = OK
 }
 
 // the tester calls Kill() when a ShardKV instance won't

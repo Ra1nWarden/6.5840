@@ -58,19 +58,26 @@ type Snapshot struct {
 }
 
 func (kv *KVServer) waitForSuccessfulCommit(term int, index int) bool {
+	timeout := time.After(10 * time.Second) // 10 second timeout
+	startTime := time.Now()
 	for {
-		newTerm, newIsLeader := kv.rf.GetState()
-		if newTerm != term || !newIsLeader {
+		select {
+		case <-timeout:
+			DPrintf("Server %d: waitForSuccessfulCommit timeout after %v for index %d", kv.me, time.Since(startTime), index)
 			return false
+		default:
+			newTerm, newIsLeader := kv.rf.GetState()
+			if newTerm != term || !newIsLeader {
+				DPrintf("Server %d: leader changed or term changed, giving up", kv.me)
+				return false
+			}
+			if kv.latestIndex >= index {
+				DPrintf("Server %d: commit successful for index %d", kv.me, index)
+				return true
+			}
+			kv.cond.Wait()
 		}
-		if kv.latestIndex > index {
-			return false
-		} else if kv.latestIndex == index {
-			return true
-		}
-		kv.cond.Wait()
 	}
-
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
