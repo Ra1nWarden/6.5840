@@ -30,6 +30,7 @@ type Op struct {
 	Value     string
 	RequestId int64
 	ClientId  int64
+	Config    shardctrler.Config
 }
 
 type ShardKV struct {
@@ -165,12 +166,16 @@ func (kv *ShardKV) apply() {
 			kv.mu.Lock()
 			kv.latestIndex = msg.CommandIndex
 			kv.cond.Broadcast()
+			if command.Operation == "Config" {
+				kv.config = shardctrler.CopyConfig(command.Config)
+				kv.mu.Unlock()
+				continue
+			}
 			if kv.prevRequest[command.ClientId] == command.RequestId {
 				kv.mu.Unlock()
 				continue
 			}
 			kv.prevRequest[command.ClientId] = command.RequestId
-			kv.config = kv.mck.Query(-1)
 			if kv.config.Shards[key2shard(command.Key)] != kv.gid {
 				DPrintf("wrong group %d %d config is %v\n", kv.config.Shards[key2shard(command.Key)], kv.gid, kv.config)
 				kv.mu.Unlock()
@@ -233,7 +238,14 @@ func (kv *ShardKV) saveSnapshot() []byte {
 func (kv *ShardKV) ticker() {
 	for {
 		kv.mu.Lock()
-		kv.config = kv.mck.Query(-1)
+		newConfig := kv.mck.Query(-1)
+		if newConfig.Num > kv.config.Num {
+			op := Op{
+				Operation: "Config",
+				Config:    newConfig,
+			}
+			kv.rf.Start(op)
+		}
 		kv.cond.Broadcast()
 		if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 			snapshot := kv.saveSnapshot()

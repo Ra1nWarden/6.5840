@@ -256,19 +256,9 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 func (sc *ShardCtrler) copyFromLastConfig() *Config {
 	lastConfig := sc.configs[len(sc.configs)-1]
-
-	newConfig := Config{
-		Num:    len(sc.configs),
-		Shards: lastConfig.Shards,
-		Groups: make(map[int][]string),
-	}
-
-	for gid, servers := range lastConfig.Groups {
-		newConfig.Groups[gid] = servers
-	}
-
+	newConfig := CopyConfig(lastConfig)
+	newConfig.Num = len(sc.configs)
 	sc.configs = append(sc.configs, newConfig)
-
 	return &sc.configs[len(sc.configs)-1]
 }
 
