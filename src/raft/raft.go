@@ -367,6 +367,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.commitIndex = index
 	}
 	DPrintf("Snapshot is finished on %d for index %d", rf.me, index)
+	rf.persist()
 	rf.mu.Unlock()
 }
 
