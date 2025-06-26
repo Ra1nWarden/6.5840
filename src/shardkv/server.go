@@ -99,6 +99,12 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		ClientId:  args.ClientId,
 	}
 
+	if kv.prevRequest[args.ClientId] == args.RequestId {
+		reply.Err = OK
+		reply.Value = kv.prevResponse[args.ClientId]
+		return
+	}
+
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -129,6 +135,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:     args.Value,
 		RequestId: args.RequestId,
 		ClientId:  args.ClientId,
+	}
+
+	if kv.prevRequest[args.ClientId] == args.RequestId {
+		reply.Err = OK
+		return
 	}
 
 	index, term, isLeader := kv.rf.Start(op)
@@ -171,16 +182,19 @@ func (kv *ShardKV) apply() {
 				kv.mu.Unlock()
 				continue
 			}
-			if kv.prevRequest[command.ClientId] == command.RequestId {
-				kv.mu.Unlock()
-				continue
-			}
-			kv.prevRequest[command.ClientId] = command.RequestId
+
 			if kv.config.Shards[key2shard(command.Key)] != kv.gid {
 				DPrintf("wrong group %d %d config is %v\n", kv.config.Shards[key2shard(command.Key)], kv.gid, kv.config)
 				kv.mu.Unlock()
 				continue
 			}
+
+			if kv.prevRequest[command.ClientId] == command.RequestId {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.prevRequest[command.ClientId] = command.RequestId
+
 			switch command.Operation {
 			case "Put":
 				kv.data[command.Key] = command.Value
